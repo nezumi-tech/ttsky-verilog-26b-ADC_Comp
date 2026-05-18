@@ -54,11 +54,11 @@ async def test_project(dut):
     # bit 0: spi_cs_n       = 1
     # bit 1: spi_sck        = 0
     # bit 2: uart_tx_pin    = 1 
-    # bit 3: pulse_parallel = 1 (出力ON)
+    # bit 3: pulse_parallel = 0 (出力OFF)
     # bit 4: pulse_series   = 0
     # bit 7:5: led          = 110 (ST_PULSE_INIT(1)の反転)
-    # -> 2進数: 1100 1101 = 0xCD (205)
+    # -> 2進数: 1100 0101 = 0xC5 (197)
     dut._log.info("Checking ST_PULSE_INIT state")
-    assert int(dut.uo_out.value) == 0xCD, f"Expected 0xCD, but got {hex(dut.uo_out.value)}"
+    assert int(dut.uo_out.value) == 0xC5, f"Expected 0xC5, but got {hex(dut.uo_out.value)}"
 
     dut._log.info("All tests passed! Ready for Tapeout!")

@@ -137,7 +137,6 @@ module pveh_optimizer_core (
 
     // データ・演算レジスタ
     reg [15:0] val_A, val_B, val_C, val_D;
-    reg [31:0] sq_A, sq_B, sq_C, sq_D;
     reg signed [32:0] diff_P, diff_S;
     
     // UART送信用 絶対値・符号レジスタ
@@ -264,41 +263,46 @@ module pveh_optimizer_core (
                     if (spi_done) begin val_D <= spi_data; state <= ST_CALC_SQ; end
                 end
 
+// ----------------------------------------
+                // 演算・最終決定 (因数分解による乗算器の削減)
+                // ----------------------------------------
+                // sq_A ~ sq_D のステートは削除し、差分の計算に直行します。
+                
                 ST_CALC_SQ: begin
-                    sq_A <= val_A * val_A; sq_B <= val_B * val_B;
-                    sq_C <= val_C * val_C; sq_D <= val_D * val_D;
+                    // (B - A) * (B + A) を計算 (乗算器を1つだけ使用)
+                    // ※オーバーフローを防ぐため、16bitを18bit符号付きに拡張して計算
+                    diff_P <= ($signed({2'b00, val_B}) - $signed({2'b00, val_A})) * 
+                              ($signed({2'b00, val_B}) + $signed({2'b00, val_A}));
                     state <= ST_CALC_DIFF;
                 end
 
                 ST_CALC_DIFF: begin
-                    diff_P <= $signed({1'b0, sq_B}) - $signed({1'b0, sq_A});
-                    diff_S <= $signed({1'b0, sq_D}) - $signed({1'b0, sq_C});
+                    // (D - C) * (D + C) を計算 (上の乗算器を使い回す)
+                    diff_S <= ($signed({2'b00, val_D}) - $signed({2'b00, val_C})) * 
+                              ($signed({2'b00, val_D}) + $signed({2'b00, val_C}));
                     timer  <= 23'd0;
                     state  <= ST_CALC_CMP;
                 end
 
                 ST_CALC_CMP: begin
-                    // 比較結果の文字化
                     if (diff_P > diff_S)       cmp_char <= 8'h3E; // '>'
                     else if (diff_P < diff_S)  cmp_char <= 8'h3C; // '<'
                     else                       cmp_char <= 8'h3D; // '='
 
-                    // 勝った方へ切り替えフラグを立てる
                     if (diff_P >= diff_S) pulse_parallel <= 1'b1;
                     else                  pulse_series   <= 1'b1;
 
-                    // UART送信用に絶対値と符号を分離
-                    if (diff_P[32]) begin abs_diff_P <= -diff_P; sign_P <= 8'h2D; /*-*/ end
-                    else            begin abs_diff_P <=  diff_P; sign_P <= 8'h2B; /*+*/ end
+                    // diff_P, diff_S は最大33bitなので、32bit分を絶対値として抽出
+                    if (diff_P[32]) begin abs_diff_P <= -diff_P[31:0]; sign_P <= 8'h2D; /*-*/ end
+                    else            begin abs_diff_P <=  diff_P[31:0]; sign_P <= 8'h2B; /*+*/ end
 
-                    if (diff_S[32]) begin abs_diff_S <= -diff_S; sign_S <= 8'h2D; /*-*/ end
-                    else            begin abs_diff_S <=  diff_S; sign_S <= 8'h2B; /*+*/ end
+                    if (diff_S[32]) begin abs_diff_S <= -diff_S[31:0]; sign_S <= 8'h2D; /*-*/ end
+                    else            begin abs_diff_S <=  diff_S[31:0]; sign_S <= 8'h2B; /*+*/ end
 
                     state <= ST_PLS_WINNER;
                 end
 
                 ST_PLS_WINNER: begin
-                    // 勝者回路へ5msの切り替えパルスを出力
                     if (timer >= COUNT_5MS - 1) begin
                         pulse_parallel <= 1'b0;
                         pulse_series   <= 1'b0;
@@ -307,71 +311,47 @@ module pveh_optimizer_core (
                     end else timer <= timer + 1'b1;
                 end
 
+                // ----------------------------------------
+                // UART送信 (文字数を削減しマルチプレクサを小型化)
+                // ----------------------------------------
                 ST_TX_SEND: begin
                     if (!uart_busy && !uart_start) begin
                         uart_start <= 1'b1;
                         case (tx_idx)
-                            // A (4 chars + comma)
+                            // A, B, C, D (各4文字 + カンマ)
                             0: uart_data <= hex2ascii(val_A[15:12]); 1: uart_data <= hex2ascii(val_A[11:8]);
                             2: uart_data <= hex2ascii(val_A[7:4]);   3: uart_data <= hex2ascii(val_A[3:0]);
                             4: uart_data <= 8'h2C;
-                            // B (4 chars + comma)
                             5: uart_data <= hex2ascii(val_B[15:12]); 6: uart_data <= hex2ascii(val_B[11:8]);
                             7: uart_data <= hex2ascii(val_B[7:4]);   8: uart_data <= hex2ascii(val_B[3:0]);
                             9: uart_data <= 8'h2C;
-                            // C (4 chars + comma)
                             10: uart_data <= hex2ascii(val_C[15:12]); 11: uart_data <= hex2ascii(val_C[11:8]);
                             12: uart_data <= hex2ascii(val_C[7:4]);   13: uart_data <= hex2ascii(val_C[3:0]);
                             14: uart_data <= 8'h2C;
-                            // D (4 chars + comma)
                             15: uart_data <= hex2ascii(val_D[15:12]); 16: uart_data <= hex2ascii(val_D[11:8]);
                             17: uart_data <= hex2ascii(val_D[7:4]);   18: uart_data <= hex2ascii(val_D[3:0]);
                             19: uart_data <= 8'h2C;
 
-                            // sq_A (8 chars + comma)
-                            20: uart_data <= hex2ascii(sq_A[31:28]); 21: uart_data <= hex2ascii(sq_A[27:24]);
-                            22: uart_data <= hex2ascii(sq_A[23:20]); 23: uart_data <= hex2ascii(sq_A[19:16]);
-                            24: uart_data <= hex2ascii(sq_A[15:12]); 25: uart_data <= hex2ascii(sq_A[11:8]);
-                            26: uart_data <= hex2ascii(sq_A[7:4]);   27: uart_data <= hex2ascii(sq_A[3:0]);
-                            28: uart_data <= 8'h2C;
-                            // sq_B (8 chars + comma)
-                            29: uart_data <= hex2ascii(sq_B[31:28]); 30: uart_data <= hex2ascii(sq_B[27:24]);
-                            31: uart_data <= hex2ascii(sq_B[23:20]); 32: uart_data <= hex2ascii(sq_B[19:16]);
-                            33: uart_data <= hex2ascii(sq_B[15:12]); 34: uart_data <= hex2ascii(sq_B[11:8]);
-                            35: uart_data <= hex2ascii(sq_B[7:4]);   36: uart_data <= hex2ascii(sq_B[3:0]);
-                            37: uart_data <= 8'h2C;
-                            // sq_C (8 chars + comma)
-                            38: uart_data <= hex2ascii(sq_C[31:28]); 39: uart_data <= hex2ascii(sq_C[27:24]);
-                            40: uart_data <= hex2ascii(sq_C[23:20]); 41: uart_data <= hex2ascii(sq_C[19:16]);
-                            42: uart_data <= hex2ascii(sq_C[15:12]); 43: uart_data <= hex2ascii(sq_C[11:8]);
-                            44: uart_data <= hex2ascii(sq_C[7:4]);   45: uart_data <= hex2ascii(sq_C[3:0]);
-                            46: uart_data <= 8'h2C;
-                            // sq_D (8 chars + comma)
-                            47: uart_data <= hex2ascii(sq_D[31:28]); 48: uart_data <= hex2ascii(sq_D[27:24]);
-                            49: uart_data <= hex2ascii(sq_D[23:20]); 50: uart_data <= hex2ascii(sq_D[19:16]);
-                            51: uart_data <= hex2ascii(sq_D[15:12]); 52: uart_data <= hex2ascii(sq_D[11:8]);
-                            53: uart_data <= hex2ascii(sq_D[7:4]);   54: uart_data <= hex2ascii(sq_D[3:0]);
-                            55: uart_data <= 8'h2C;
+                            // diff_P (符号 + 8文字 + カンマ)
+                            20: uart_data <= sign_P;
+                            21: uart_data <= hex2ascii(abs_diff_P[31:28]); 22: uart_data <= hex2ascii(abs_diff_P[27:24]);
+                            23: uart_data <= hex2ascii(abs_diff_P[23:20]); 24: uart_data <= hex2ascii(abs_diff_P[19:16]);
+                            25: uart_data <= hex2ascii(abs_diff_P[15:12]); 26: uart_data <= hex2ascii(abs_diff_P[11:8]);
+                            27: uart_data <= hex2ascii(abs_diff_P[7:4]);   28: uart_data <= hex2ascii(abs_diff_P[3:0]);
+                            29: uart_data <= 8'h2C;
 
-                            // diff_P (Sign + 8 chars + comma)
-                            56: uart_data <= sign_P;
-                            57: uart_data <= hex2ascii(abs_diff_P[31:28]); 58: uart_data <= hex2ascii(abs_diff_P[27:24]);
-                            59: uart_data <= hex2ascii(abs_diff_P[23:20]); 60: uart_data <= hex2ascii(abs_diff_P[19:16]);
-                            61: uart_data <= hex2ascii(abs_diff_P[15:12]); 62: uart_data <= hex2ascii(abs_diff_P[11:8]);
-                            63: uart_data <= hex2ascii(abs_diff_P[7:4]);   64: uart_data <= hex2ascii(abs_diff_P[3:0]);
-                            65: uart_data <= 8'h2C;
-                            // diff_S (Sign + 8 chars + comma)
-                            66: uart_data <= sign_S;
-                            67: uart_data <= hex2ascii(abs_diff_S[31:28]); 68: uart_data <= hex2ascii(abs_diff_S[27:24]);
-                            69: uart_data <= hex2ascii(abs_diff_S[23:20]); 70: uart_data <= hex2ascii(abs_diff_S[19:16]);
-                            71: uart_data <= hex2ascii(abs_diff_S[15:12]); 72: uart_data <= hex2ascii(abs_diff_S[11:8]);
-                            73: uart_data <= hex2ascii(abs_diff_S[7:4]);   74: uart_data <= hex2ascii(abs_diff_S[3:0]);
-                            75: uart_data <= 8'h2C;
+                            // diff_S (符号 + 8文字 + カンマ)
+                            30: uart_data <= sign_S;
+                            31: uart_data <= hex2ascii(abs_diff_S[31:28]); 32: uart_data <= hex2ascii(abs_diff_S[27:24]);
+                            33: uart_data <= hex2ascii(abs_diff_S[23:20]); 34: uart_data <= hex2ascii(abs_diff_S[19:16]);
+                            35: uart_data <= hex2ascii(abs_diff_S[15:12]); 36: uart_data <= hex2ascii(abs_diff_S[11:8]);
+                            37: uart_data <= hex2ascii(abs_diff_S[7:4]);   38: uart_data <= hex2ascii(abs_diff_S[3:0]);
+                            39: uart_data <= 8'h2C;
 
                             // 比較結果 & CRLF
-                            76: uart_data <= cmp_char;  // '>' or '<' or '='
-                            77: uart_data <= 8'h0D;     // \r
-                            78: uart_data <= 8'h0A;     // \n
+                            40: uart_data <= cmp_char;  
+                            41: uart_data <= 8'h0D;     // \r
+                            42: uart_data <= 8'h0A;     // \n
                             default: uart_data <= 8'h00;
                         endcase
                     end else if (uart_start) begin
@@ -382,8 +362,8 @@ module pveh_optimizer_core (
 
                 ST_TX_WAIT: begin
                     if (!uart_start && !uart_busy) begin
-                        if (tx_idx == 7'd78) begin
-                            state <= ST_IDLE; // 全文字送信完了、次のトリガ待ちへ戻る
+                        if (tx_idx == 7'd42) begin // 最大インデックスを42に変更
+                            state <= ST_IDLE; 
                         end else begin
                             tx_idx <= tx_idx + 1'b1;
                             state  <= ST_TX_SEND;

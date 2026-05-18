@@ -137,7 +137,7 @@ module pveh_optimizer_core (
 
     // データ・演算レジスタ
     reg [15:0] val_A, val_B, val_C, val_D;
-    reg signed [32:0] diff_P, diff_S;
+    reg signed [33:0] diff_P, diff_S; // (B-A)*(B+A) の結果を格納するため拡張
     
     // UART送信用 絶対値・符号レジスタ
     reg [31:0] abs_diff_P, abs_diff_S;
@@ -182,8 +182,7 @@ module pveh_optimizer_core (
             uart_start <= 1'b0;
             tx_idx <= 7'd0;
             {val_A, val_B, val_C, val_D} <= 64'd0;
-            {sq_A, sq_B, sq_C, sq_D} <= 128'd0;
-            diff_P <= 33'd0; diff_S <= 33'd0;
+            diff_P <= 34'd0; diff_S <= 34'd0;
             abs_diff_P <= 32'd0; abs_diff_S <= 32'd0;
             sign_P <= 8'd0; sign_S <= 8'd0; cmp_char <= 8'd0;
         end else begin
@@ -263,21 +262,14 @@ module pveh_optimizer_core (
                     if (spi_done) begin val_D <= spi_data; state <= ST_CALC_SQ; end
                 end
 
-// ----------------------------------------
-                // 演算・最終決定 (因数分解による乗算器の削減)
-                // ----------------------------------------
-                // sq_A ~ sq_D のステートは削除し、差分の計算に直行します。
-                
                 ST_CALC_SQ: begin
-                    // (B - A) * (B + A) を計算 (乗算器を1つだけ使用)
-                    // ※オーバーフローを防ぐため、16bitを18bit符号付きに拡張して計算
+                    // 面積削減のため、乗算器を (B-A)*(B+A) の因数分解で共有化
                     diff_P <= ($signed({2'b00, val_B}) - $signed({2'b00, val_A})) * 
                               ($signed({2'b00, val_B}) + $signed({2'b00, val_A}));
                     state <= ST_CALC_DIFF;
                 end
 
                 ST_CALC_DIFF: begin
-                    // (D - C) * (D + C) を計算 (上の乗算器を使い回す)
                     diff_S <= ($signed({2'b00, val_D}) - $signed({2'b00, val_C})) * 
                               ($signed({2'b00, val_D}) + $signed({2'b00, val_C}));
                     timer  <= 23'd0;
@@ -292,11 +284,11 @@ module pveh_optimizer_core (
                     if (diff_P >= diff_S) pulse_parallel <= 1'b1;
                     else                  pulse_series   <= 1'b1;
 
-                    // diff_P, diff_S は最大33bitなので、32bit分を絶対値として抽出
-                    if (diff_P[32]) begin abs_diff_P <= -diff_P[31:0]; sign_P <= 8'h2D; /*-*/ end
+                    // 上位ビットを削り、32bit幅の絶対値として抽出
+                    if (diff_P[33]) begin abs_diff_P <= -diff_P[31:0]; sign_P <= 8'h2D; /*-*/ end
                     else            begin abs_diff_P <=  diff_P[31:0]; sign_P <= 8'h2B; /*+*/ end
 
-                    if (diff_S[32]) begin abs_diff_S <= -diff_S[31:0]; sign_S <= 8'h2D; /*-*/ end
+                    if (diff_S[33]) begin abs_diff_S <= -diff_S[31:0]; sign_S <= 8'h2D; /*-*/ end
                     else            begin abs_diff_S <=  diff_S[31:0]; sign_S <= 8'h2B; /*+*/ end
 
                     state <= ST_PLS_WINNER;
@@ -311,14 +303,10 @@ module pveh_optimizer_core (
                     end else timer <= timer + 1'b1;
                 end
 
-                // ----------------------------------------
-                // UART送信 (文字数を削減しマルチプレクサを小型化)
-                // ----------------------------------------
                 ST_TX_SEND: begin
                     if (!uart_busy && !uart_start) begin
                         uart_start <= 1'b1;
                         case (tx_idx)
-                            // A, B, C, D (各4文字 + カンマ)
                             0: uart_data <= hex2ascii(val_A[15:12]); 1: uart_data <= hex2ascii(val_A[11:8]);
                             2: uart_data <= hex2ascii(val_A[7:4]);   3: uart_data <= hex2ascii(val_A[3:0]);
                             4: uart_data <= 8'h2C;
@@ -331,27 +319,21 @@ module pveh_optimizer_core (
                             15: uart_data <= hex2ascii(val_D[15:12]); 16: uart_data <= hex2ascii(val_D[11:8]);
                             17: uart_data <= hex2ascii(val_D[7:4]);   18: uart_data <= hex2ascii(val_D[3:0]);
                             19: uart_data <= 8'h2C;
-
-                            // diff_P (符号 + 8文字 + カンマ)
                             20: uart_data <= sign_P;
                             21: uart_data <= hex2ascii(abs_diff_P[31:28]); 22: uart_data <= hex2ascii(abs_diff_P[27:24]);
                             23: uart_data <= hex2ascii(abs_diff_P[23:20]); 24: uart_data <= hex2ascii(abs_diff_P[19:16]);
                             25: uart_data <= hex2ascii(abs_diff_P[15:12]); 26: uart_data <= hex2ascii(abs_diff_P[11:8]);
                             27: uart_data <= hex2ascii(abs_diff_P[7:4]);   28: uart_data <= hex2ascii(abs_diff_P[3:0]);
                             29: uart_data <= 8'h2C;
-
-                            // diff_S (符号 + 8文字 + カンマ)
                             30: uart_data <= sign_S;
                             31: uart_data <= hex2ascii(abs_diff_S[31:28]); 32: uart_data <= hex2ascii(abs_diff_S[27:24]);
                             33: uart_data <= hex2ascii(abs_diff_S[23:20]); 34: uart_data <= hex2ascii(abs_diff_S[19:16]);
                             35: uart_data <= hex2ascii(abs_diff_S[15:12]); 36: uart_data <= hex2ascii(abs_diff_S[11:8]);
                             37: uart_data <= hex2ascii(abs_diff_S[7:4]);   38: uart_data <= hex2ascii(abs_diff_S[3:0]);
                             39: uart_data <= 8'h2C;
-
-                            // 比較結果 & CRLF
                             40: uart_data <= cmp_char;  
-                            41: uart_data <= 8'h0D;     // \r
-                            42: uart_data <= 8'h0A;     // \n
+                            41: uart_data <= 8'h0D;
+                            42: uart_data <= 8'h0A;
                             default: uart_data <= 8'h00;
                         endcase
                     end else if (uart_start) begin
@@ -362,7 +344,7 @@ module pveh_optimizer_core (
 
                 ST_TX_WAIT: begin
                     if (!uart_start && !uart_busy) begin
-                        if (tx_idx == 7'd42) begin // 最大インデックスを42に変更
+                        if (tx_idx == 7'd42) begin 
                             state <= ST_IDLE; 
                         end else begin
                             tx_idx <= tx_idx + 1'b1;
@@ -406,7 +388,6 @@ module ltc2450_spi_read_sync_32k (
         else        {start_d1, start_d2} <= {start, start_d1};
     end
 
-    // 32.768kHzでは分周不要なため、クロックをそのまま利用
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) sck_tick <= 1'b0;
         else        sck_tick <= 1'b1; 
@@ -418,30 +399,30 @@ module ltc2450_spi_read_sync_32k (
             spi_cs_n <= 1'b1; spi_sck <= 1'b0; bit_cnt <= 5'd0; shift_reg <= 16'd0; wait_cnt <= 12'd0;
         end else begin
             case (state)
-                3'd0: begin // IDLE
+                3'd0: begin 
                     done <= 1'b0;
                     if (start_pulse) begin busy <= 1'b1; spi_cs_n <= 1'b0; state <= 3'd1; end
                 end
                 3'd1: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; state <= 3'd2; end 
-                3'd2: begin // DUMMY_DATA (空読み)
+                3'd2: begin 
                     if (sck_tick) begin
                         if (spi_sck == 1'b0) spi_sck <= 1'b1;
                         else begin
                             spi_sck <= 1'b0;
                             if (bit_cnt == 5'd15) begin
                                 spi_cs_n <= 1'b1;
-                                wait_cnt <= 12'd1311; // 40ms待機 (32768 * 0.04)
+                                wait_cnt <= 12'd1311; // 40ms待機
                                 state    <= 3'd3;
                             end else bit_cnt <= bit_cnt + 1'b1;
                         end
                     end
                 end
-                3'd3: begin // WAIT_CONV
+                3'd3: begin 
                     if (wait_cnt == 12'd0) begin spi_cs_n <= 1'b0; state <= 3'd4; end
                     else wait_cnt <= wait_cnt - 1'b1;
                 end
                 3'd4: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; shift_reg <= 16'd0; state <= 3'd5; end
-                3'd5: begin // REAL_DATA (本番読み)
+                3'd5: begin 
                     if (sck_tick) begin
                         if (spi_sck == 1'b0) begin spi_sck <= 1'b1; shift_reg <= {shift_reg[14:0], spi_sdo}; end
                         else begin
@@ -469,7 +450,6 @@ module uart_tx_32k (
     output reg        tx_busy,
     output reg        uart_txd
 );
-    // 32768 / 1200 ≒ 27
     reg [4:0] clk_cnt; 
     reg [3:0] bit_cnt;
     reg [7:0] tx_reg;
@@ -481,25 +461,25 @@ module uart_tx_32k (
             clk_cnt <= 5'd0; bit_cnt <= 4'd0; tx_reg <= 8'd0;
         end else begin
             case (state)
-                2'd0: begin // IDLE
+                2'd0: begin 
                     tx_busy <= 1'b0; uart_txd <= 1'b1;
                     if (tx_start) begin
                         tx_reg <= tx_data; tx_busy <= 1'b1; uart_txd <= 1'b0;
                         clk_cnt <= 5'd0; state <= 2'd1;
                     end
                 end
-                2'd1: begin // START
+                2'd1: begin 
                     if (clk_cnt == 5'd26) begin clk_cnt <= 5'd0; uart_txd <= tx_reg[0]; bit_cnt <= 4'd0; state <= 2'd2; end
                     else clk_cnt <= clk_cnt + 1'b1;
                 end
-                2'd2: begin // DATA
+                2'd2: begin 
                     if (clk_cnt == 5'd26) begin
                         clk_cnt <= 5'd0;
                         if (bit_cnt == 4'd7) begin uart_txd <= 1'b1; state <= 2'd3; end
                         else begin tx_reg <= {1'b0, tx_reg[7:1]}; uart_txd <= tx_reg[1]; bit_cnt <= bit_cnt + 1'b1; end
                     end else clk_cnt <= clk_cnt + 1'b1;
                 end
-                2'd3: begin // STOP
+                2'd3: begin 
                     if (clk_cnt == 5'd26) state <= 2'd0;
                     else clk_cnt <= clk_cnt + 1'b1;
                 end

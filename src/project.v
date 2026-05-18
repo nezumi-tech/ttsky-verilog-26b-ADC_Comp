@@ -5,28 +5,28 @@
 
 `default_nettype none
 
+// =======================================================================
+// [トップモジュール] Tiny Tapeout 向けラッパー
+// =======================================================================
 module tt_um_nezumi_tech_adc_sq_compare (
     input  wire [7:0] ui_in,    // 専用入力
     output wire [7:0] uo_out,   // 専用出力
-    input  wire [7:0] uio_in,   // 双方向IO (入力)
-    output wire [7:0] uio_out,  // 双方向IO (出力)
-    output wire [7:0] uio_oe,   // 双方向IOの出力イネーブル (1=出力, 0=入力)
-    input  wire       ena,      // デザインのイネーブル信号
-    input  wire       clk,      // クロック (想定: 32.768 kHz)
-    input  wire       rst_n     // アクティブロー・リセット
+    input  wire [7:0] uio_in,   // 双方向IO (入力パス)
+    output wire [7:0] uio_out,  // 双方向IO (出力パス)
+    output wire [7:0] uio_oe,   // 双方向IO 出力イネーブル (1=出力, 0=入力)
+    input  wire       ena,      // デザインイネーブル
+    input  wire       clk,      // システムクロック (32.768 kHz)
+    input  wire       rst_n     // アクティブローリセット
 );
 
-    // ==========================================
-    // 1. ピンの割り当てと未使用ピンの処理
-    // ==========================================
-    
-    // 入力ピンのアサイン
+    // ----------------------------------------------------
+    // ピンの割り当て
+    // ----------------------------------------------------
     wire       ext_trigger = ui_in[0];    // 計測開始トリガ
     wire       spi_sdo     = ui_in[1];    // LTC2450からのデータ入力
-    wire [2:0] cfg_stable  = ui_in[4:2];  // 安定待ち時間 (2^N 秒)
-    wire [2:0] cfg_charge  = ui_in[7:5];  // 充電待ち時間 (2^N 秒)
+    wire [2:0] cfg_stable  = ui_in[4:2];  // 安定待ち時間設定 (2^N 秒)
+    wire [2:0] cfg_charge  = ui_in[7:5];  // 充電待ち時間設定 (2^N 秒)
 
-    // 出力ピン用の内部ワイヤ
     wire       spi_cs_n;
     wire       spi_sck;
     wire       uart_tx_pin;
@@ -34,7 +34,6 @@ module tt_um_nezumi_tech_adc_sq_compare (
     wire       pulse_series;
     wire [2:0] led;
 
-    // 出力ピンのアサイン
     assign uo_out[0]   = spi_cs_n;
     assign uo_out[1]   = spi_sck;
     assign uo_out[2]   = uart_tx_pin;
@@ -42,16 +41,16 @@ module tt_um_nezumi_tech_adc_sq_compare (
     assign uo_out[4]   = pulse_series;
     assign uo_out[7:5] = led;
 
-    // 双方向ピン(uio)は今回すべて未使用のため、入力モード(0)に固定し、出力値を0に落とす
+    // 今回、双方向ピン(uio)は使用しないためすべて入力モード(0)に固定
     assign uio_oe  = 8'b0000_0000;
     assign uio_out = 8'b0000_0000;
 
     // 未使用入力信号のワーニング回避 (Linter対策)
     wire _unused = &{ena, uio_in, 1'b0};
 
-    // ==========================================
-    // 2. メインロジック (FSM) のインスタンス化
-    // ==========================================
+    // ----------------------------------------------------
+    // コアロジックのインスタンス化
+    // ----------------------------------------------------
     pveh_optimizer_core u_core (
         .clk(clk),
         .rst_n(rst_n),
@@ -59,7 +58,6 @@ module tt_um_nezumi_tech_adc_sq_compare (
         .spi_sdo(spi_sdo),
         .cfg_stable(cfg_stable),
         .cfg_charge(cfg_charge),
-        
         .pulse_parallel(pulse_parallel),
         .pulse_series(pulse_series),
         .spi_cs_n(spi_cs_n),
@@ -72,7 +70,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール] 環境発電最適化 コアロジック (32.768kHz 駆動版)
+// [サブモジュール 1] 環境発電最適化 コアロジック (32.768kHz 駆動版)
 // =======================================================================
 module pveh_optimizer_core (
     input  wire clk,
@@ -95,11 +93,9 @@ module pveh_optimizer_core (
     
     // 5msのクロック数: 32,768 * 0.005 ≒ 164
     localparam COUNT_5MS = 164; 
-
     // 1秒のカウント値 (シフト演算用)
     localparam [22:0] COUNT_1S = CLK_FREQ;
     
-    // 設定ピンによる待機時間の生成 (最大 2^7 = 128秒)
     wire [22:0] wait_stable_max = COUNT_1S << cfg_stable;
     wire [22:0] wait_charge_max = COUNT_1S << cfg_charge;
 
@@ -124,9 +120,9 @@ module pveh_optimizer_core (
     localparam ST_TX_SEND       = 5'd16;
     localparam ST_TX_WAIT       = 5'd17;
 
-    assign led = ~state[2:0]; 
+    assign led = ~state[2:0]; // デバッグ用LED
 
-    reg [22:0] timer; // 128秒カウント用の23ビットレジスタ
+    reg [22:0] timer; 
     
     // SPI通信制御用
     reg        spi_start;
@@ -144,6 +140,10 @@ module pveh_optimizer_core (
     reg [31:0] sq_A, sq_B, sq_C, sq_D;
     reg signed [32:0] diff_P, diff_S;
     
+    // UART送信用 絶対値・符号レジスタ
+    reg [31:0] abs_diff_P, abs_diff_S;
+    reg [7:0]  sign_P, sign_S, cmp_char;
+
     // UART制御用
     reg         uart_start;
     reg [7:0]   uart_data;
@@ -163,7 +163,7 @@ module pveh_optimizer_core (
         end
     endfunction
 
-    // 外部トリガの立ち上がりエッジ検出
+    // 外部トリガのエッジ検出
     reg trig_d1, trig_d2;
     wire trig_pulse = (trig_d1 && !trig_d2);
 
@@ -185,6 +185,8 @@ module pveh_optimizer_core (
             {val_A, val_B, val_C, val_D} <= 64'd0;
             {sq_A, sq_B, sq_C, sq_D} <= 128'd0;
             diff_P <= 33'd0; diff_S <= 33'd0;
+            abs_diff_P <= 32'd0; abs_diff_S <= 32'd0;
+            sign_P <= 8'd0; sign_S <= 8'd0; cmp_char <= 8'd0;
         end else begin
             case (state)
                 ST_IDLE: begin
@@ -207,82 +209,59 @@ module pveh_optimizer_core (
 
                 ST_WAIT_STAB_P: begin
                     if (timer >= wait_stable_max - 1) begin
-                        spi_start <= 1'b1;
-                        state <= ST_READ_A;
+                        spi_start <= 1'b1; state <= ST_READ_A;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_READ_A: begin
                     spi_start <= 1'b0;
-                    if (spi_done) begin
-                        val_A <= spi_data;
-                        timer <= 23'd0;
-                        state <= ST_WAIT_CHG_P;
-                    end
+                    if (spi_done) begin val_A <= spi_data; timer <= 23'd0; state <= ST_WAIT_CHG_P; end
                 end
 
                 ST_WAIT_CHG_P: begin
                     if (timer >= wait_charge_max - 1) begin
-                        spi_start <= 1'b1;
-                        state <= ST_READ_B;
+                        spi_start <= 1'b1; state <= ST_READ_B;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_READ_B: begin
                     spi_start <= 1'b0;
-                    if (spi_done) begin
-                        val_B <= spi_data;
-                        timer <= 23'd0;
-                        state <= ST_WAIT_REC; // 回路切り替え前のマージン
-                    end
+                    if (spi_done) begin val_B <= spi_data; timer <= 23'd0; state <= ST_WAIT_REC; end
                 end
 
                 ST_WAIT_REC: begin
-                    // 次の回路(Series)へ移る前に2秒待機して放電/安定化
                     if (timer >= (COUNT_1S * 2) - 1) begin
-                        timer <= 23'd0;
-                        state <= ST_PLS_SER_INIT;
+                        timer <= 23'd0; state <= ST_PLS_SER_INIT;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_PLS_SER_INIT: begin
                     pulse_series <= 1'b1;
                     if (timer >= COUNT_5MS - 1) begin
-                        pulse_series <= 1'b0;
-                        timer <= 23'd0;
-                        state <= ST_WAIT_STAB_S;
+                        pulse_series <= 1'b0; timer <= 23'd0; state <= ST_WAIT_STAB_S;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_WAIT_STAB_S: begin
                     if (timer >= wait_stable_max - 1) begin
-                        spi_start <= 1'b1;
-                        state <= ST_READ_C;
+                        spi_start <= 1'b1; state <= ST_READ_C;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_READ_C: begin
                     spi_start <= 1'b0;
-                    if (spi_done) begin
-                        val_C <= spi_data;
-                        timer <= 23'd0;
-                        state <= ST_WAIT_CHG_S;
-                    end
+                    if (spi_done) begin val_C <= spi_data; timer <= 23'd0; state <= ST_WAIT_CHG_S; end
                 end
 
                 ST_WAIT_CHG_S: begin
                     if (timer >= wait_charge_max - 1) begin
-                        spi_start <= 1'b1;
-                        state <= ST_READ_D;
+                        spi_start <= 1'b1; state <= ST_READ_D;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_READ_D: begin
                     spi_start <= 1'b0;
-                    if (spi_done) begin
-                        val_D <= spi_data;
-                        state <= ST_CALC_SQ;
-                    end
+                    if (spi_done) begin val_D <= spi_data; state <= ST_CALC_SQ; end
                 end
 
                 ST_CALC_SQ: begin
@@ -299,12 +278,27 @@ module pveh_optimizer_core (
                 end
 
                 ST_CALC_CMP: begin
+                    // 比較結果の文字化
+                    if (diff_P > diff_S)       cmp_char <= 8'h3E; // '>'
+                    else if (diff_P < diff_S)  cmp_char <= 8'h3C; // '<'
+                    else                       cmp_char <= 8'h3D; // '='
+
+                    // 勝った方へ切り替えフラグを立てる
                     if (diff_P >= diff_S) pulse_parallel <= 1'b1;
                     else                  pulse_series   <= 1'b1;
+
+                    // UART送信用に絶対値と符号を分離
+                    if (diff_P[32]) begin abs_diff_P <= -diff_P; sign_P <= 8'h2D; /*-*/ end
+                    else            begin abs_diff_P <=  diff_P; sign_P <= 8'h2B; /*+*/ end
+
+                    if (diff_S[32]) begin abs_diff_S <= -diff_S; sign_S <= 8'h2D; /*-*/ end
+                    else            begin abs_diff_S <=  diff_S; sign_S <= 8'h2B; /*+*/ end
+
                     state <= ST_PLS_WINNER;
                 end
 
                 ST_PLS_WINNER: begin
+                    // 勝者回路へ5msの切り替えパルスを出力
                     if (timer >= COUNT_5MS - 1) begin
                         pulse_parallel <= 1'b0;
                         pulse_series   <= 1'b0;
@@ -316,17 +310,68 @@ module pveh_optimizer_core (
                 ST_TX_SEND: begin
                     if (!uart_busy && !uart_start) begin
                         uart_start <= 1'b1;
-                        // 簡易化のため値の一部のみ送信例を記載。前回の長いcase文をここに入れます
                         case (tx_idx)
+                            // A (4 chars + comma)
                             0: uart_data <= hex2ascii(val_A[15:12]); 1: uart_data <= hex2ascii(val_A[11:8]);
                             2: uart_data <= hex2ascii(val_A[7:4]);   3: uart_data <= hex2ascii(val_A[3:0]);
-                            4: uart_data <= 8'h2C; // ','
+                            4: uart_data <= 8'h2C;
+                            // B (4 chars + comma)
                             5: uart_data <= hex2ascii(val_B[15:12]); 6: uart_data <= hex2ascii(val_B[11:8]);
                             7: uart_data <= hex2ascii(val_B[7:4]);   8: uart_data <= hex2ascii(val_B[3:0]);
-                            // ... 中略 (前回のC, D, 差分等の処理をそのまま配置してください) ...
-                            10: uart_data <= (diff_P >= diff_S) ? 8'h3E /*>*/ : 8'h3C /*<*/;
-                            11: uart_data <= 8'h0D; // \r
-                            12: uart_data <= 8'h0A; // \n
+                            9: uart_data <= 8'h2C;
+                            // C (4 chars + comma)
+                            10: uart_data <= hex2ascii(val_C[15:12]); 11: uart_data <= hex2ascii(val_C[11:8]);
+                            12: uart_data <= hex2ascii(val_C[7:4]);   13: uart_data <= hex2ascii(val_C[3:0]);
+                            14: uart_data <= 8'h2C;
+                            // D (4 chars + comma)
+                            15: uart_data <= hex2ascii(val_D[15:12]); 16: uart_data <= hex2ascii(val_D[11:8]);
+                            17: uart_data <= hex2ascii(val_D[7:4]);   18: uart_data <= hex2ascii(val_D[3:0]);
+                            19: uart_data <= 8'h2C;
+
+                            // sq_A (8 chars + comma)
+                            20: uart_data <= hex2ascii(sq_A[31:28]); 21: uart_data <= hex2ascii(sq_A[27:24]);
+                            22: uart_data <= hex2ascii(sq_A[23:20]); 23: uart_data <= hex2ascii(sq_A[19:16]);
+                            24: uart_data <= hex2ascii(sq_A[15:12]); 25: uart_data <= hex2ascii(sq_A[11:8]);
+                            26: uart_data <= hex2ascii(sq_A[7:4]);   27: uart_data <= hex2ascii(sq_A[3:0]);
+                            28: uart_data <= 8'h2C;
+                            // sq_B (8 chars + comma)
+                            29: uart_data <= hex2ascii(sq_B[31:28]); 30: uart_data <= hex2ascii(sq_B[27:24]);
+                            31: uart_data <= hex2ascii(sq_B[23:20]); 32: uart_data <= hex2ascii(sq_B[19:16]);
+                            33: uart_data <= hex2ascii(sq_B[15:12]); 34: uart_data <= hex2ascii(sq_B[11:8]);
+                            35: uart_data <= hex2ascii(sq_B[7:4]);   36: uart_data <= hex2ascii(sq_B[3:0]);
+                            37: uart_data <= 8'h2C;
+                            // sq_C (8 chars + comma)
+                            38: uart_data <= hex2ascii(sq_C[31:28]); 39: uart_data <= hex2ascii(sq_C[27:24]);
+                            40: uart_data <= hex2ascii(sq_C[23:20]); 41: uart_data <= hex2ascii(sq_C[19:16]);
+                            42: uart_data <= hex2ascii(sq_C[15:12]); 43: uart_data <= hex2ascii(sq_C[11:8]);
+                            44: uart_data <= hex2ascii(sq_C[7:4]);   45: uart_data <= hex2ascii(sq_C[3:0]);
+                            46: uart_data <= 8'h2C;
+                            // sq_D (8 chars + comma)
+                            47: uart_data <= hex2ascii(sq_D[31:28]); 48: uart_data <= hex2ascii(sq_D[27:24]);
+                            49: uart_data <= hex2ascii(sq_D[23:20]); 50: uart_data <= hex2ascii(sq_D[19:16]);
+                            51: uart_data <= hex2ascii(sq_D[15:12]); 52: uart_data <= hex2ascii(sq_D[11:8]);
+                            53: uart_data <= hex2ascii(sq_D[7:4]);   54: uart_data <= hex2ascii(sq_D[3:0]);
+                            55: uart_data <= 8'h2C;
+
+                            // diff_P (Sign + 8 chars + comma)
+                            56: uart_data <= sign_P;
+                            57: uart_data <= hex2ascii(abs_diff_P[31:28]); 58: uart_data <= hex2ascii(abs_diff_P[27:24]);
+                            59: uart_data <= hex2ascii(abs_diff_P[23:20]); 60: uart_data <= hex2ascii(abs_diff_P[19:16]);
+                            61: uart_data <= hex2ascii(abs_diff_P[15:12]); 62: uart_data <= hex2ascii(abs_diff_P[11:8]);
+                            63: uart_data <= hex2ascii(abs_diff_P[7:4]);   64: uart_data <= hex2ascii(abs_diff_P[3:0]);
+                            65: uart_data <= 8'h2C;
+                            // diff_S (Sign + 8 chars + comma)
+                            66: uart_data <= sign_S;
+                            67: uart_data <= hex2ascii(abs_diff_S[31:28]); 68: uart_data <= hex2ascii(abs_diff_S[27:24]);
+                            69: uart_data <= hex2ascii(abs_diff_S[23:20]); 70: uart_data <= hex2ascii(abs_diff_S[19:16]);
+                            71: uart_data <= hex2ascii(abs_diff_S[15:12]); 72: uart_data <= hex2ascii(abs_diff_S[11:8]);
+                            73: uart_data <= hex2ascii(abs_diff_S[7:4]);   74: uart_data <= hex2ascii(abs_diff_S[3:0]);
+                            75: uart_data <= 8'h2C;
+
+                            // 比較結果 & CRLF
+                            76: uart_data <= cmp_char;  // '>' or '<' or '='
+                            77: uart_data <= 8'h0D;     // \r
+                            78: uart_data <= 8'h0A;     // \n
                             default: uart_data <= 8'h00;
                         endcase
                     end else if (uart_start) begin
@@ -337,8 +382,8 @@ module pveh_optimizer_core (
 
                 ST_TX_WAIT: begin
                     if (!uart_start && !uart_busy) begin
-                        if (tx_idx == 7'd12) begin // 全文字数に合わせて変更してください
-                            state <= ST_IDLE; // シーケンス完了、次のトリガ待ちへ
+                        if (tx_idx == 7'd78) begin
+                            state <= ST_IDLE; // 全文字送信完了、次のトリガ待ちへ戻る
                         end else begin
                             tx_idx <= tx_idx + 1'b1;
                             state  <= ST_TX_SEND;
@@ -354,7 +399,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール] LTC2450 SPI 読み出し (32.768kHz 駆動版)
+// [サブモジュール 2] LTC2450 SPI 読み出し (32.768kHz 駆動版)
 // =======================================================================
 module ltc2450_spi_read_sync_32k (
     input  wire        clk,
@@ -371,7 +416,7 @@ module ltc2450_spi_read_sync_32k (
     reg [2:0] state;
     reg [4:0] bit_cnt;
     reg [15:0] shift_reg;
-    reg [11:0] wait_cnt; // 1311 を数えるために12ビットで十分
+    reg [11:0] wait_cnt; 
 
     reg start_d1, start_d2;
     wire start_pulse = (start_d1 && !start_d2);
@@ -381,10 +426,10 @@ module ltc2450_spi_read_sync_32k (
         else        {start_d1, start_d2} <= {start, start_d1};
     end
 
-    // 32.768kHzでは分周不要なため、クロックそのものをSCKの切り替えに利用します
+    // 32.768kHzでは分周不要なため、クロックをそのまま利用
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) sck_tick <= 1'b0;
-        else        sck_tick <= 1'b1; // 毎クロック処理を進める
+        else        sck_tick <= 1'b1; 
     end
 
     always @(posedge clk or negedge rst_n) begin
@@ -397,8 +442,8 @@ module ltc2450_spi_read_sync_32k (
                     done <= 1'b0;
                     if (start_pulse) begin busy <= 1'b1; spi_cs_n <= 1'b0; state <= 3'd1; end
                 end
-                3'd1: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; state <= 3'd2; end // DUMMY_PREP
-                3'd2: begin // DUMMY_DATA
+                3'd1: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; state <= 3'd2; end 
+                3'd2: begin // DUMMY_DATA (空読み)
                     if (sck_tick) begin
                         if (spi_sck == 1'b0) spi_sck <= 1'b1;
                         else begin
@@ -415,8 +460,8 @@ module ltc2450_spi_read_sync_32k (
                     if (wait_cnt == 12'd0) begin spi_cs_n <= 1'b0; state <= 3'd4; end
                     else wait_cnt <= wait_cnt - 1'b1;
                 end
-                3'd4: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; shift_reg <= 16'd0; state <= 3'd5; end // REAL_PREP
-                3'd5: begin // REAL_DATA
+                3'd4: begin spi_sck <= 1'b0; bit_cnt <= 5'd0; shift_reg <= 16'd0; state <= 3'd5; end
+                3'd5: begin // REAL_DATA (本番読み)
                     if (sck_tick) begin
                         if (spi_sck == 1'b0) begin spi_sck <= 1'b1; shift_reg <= {shift_reg[14:0], spi_sdo}; end
                         else begin
@@ -426,7 +471,7 @@ module ltc2450_spi_read_sync_32k (
                         end
                     end
                 end
-                3'd6: begin spi_cs_n <= 1'b1; busy <= 1'b0; done <= 1'b1; data_out <= shift_reg; state <= 3'd0; end // DONE
+                3'd6: begin spi_cs_n <= 1'b1; busy <= 1'b0; done <= 1'b1; data_out <= shift_reg; state <= 3'd0; end
             endcase
         end
     end
@@ -434,7 +479,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール] UART 送信 (32.768kHz, 1200bps版)
+// [サブモジュール 3] UART 送信 (32.768kHz, 1200bps版)
 // =======================================================================
 module uart_tx_32k (
     input  wire       clk,
@@ -445,7 +490,7 @@ module uart_tx_32k (
     output reg        uart_txd
 );
     // 32768 / 1200 ≒ 27
-    reg [4:0] clk_cnt; // 0〜26をカウントするため5ビットで十分
+    reg [4:0] clk_cnt; 
     reg [3:0] bit_cnt;
     reg [7:0] tx_reg;
     reg [1:0] state;

@@ -38,8 +38,8 @@ module tt_um_nezumi_tech_adc_sq_compare (
     assign uo_out[4]   = pulse_series;
     assign uo_out[7:5] = led;
 
-    assign uio_oe  = 8'b0000_0000;
-    assign uio_out = 8'b0000_0000;
+    // ★双方向ピン(uio)をすべて「出力モード(1)」に設定し、デバッグ信号を割り当て
+    assign uio_oe  = 8'b1111_1111;
 
     wire _unused = &{ena, uio_in, 1'b0};
 
@@ -55,7 +55,8 @@ module tt_um_nezumi_tech_adc_sq_compare (
         .spi_cs_n(spi_cs_n),
         .spi_sck(spi_sck),
         .uart_tx_pin(uart_tx_pin),
-        .led(led)
+        .led(led),
+        .debug_out(uio_out) // ★デバッグ信号を uio_out に接続
     );
 
 endmodule
@@ -76,7 +77,8 @@ module pveh_optimizer_core (
     output wire spi_cs_n,
     output wire spi_sck,
     output wire uart_tx_pin,
-    output wire [2:0] led
+    output wire [2:0] led,
+    output wire [7:0] debug_out // ★デバッグ出力ポートを追加
 );
 
     parameter CLK_FREQ = 32_768; 
@@ -101,7 +103,8 @@ module pveh_optimizer_core (
     localparam ST_WAIT_REC     = 4'd10;
     localparam ST_PLS_WINNER   = 4'd11;
 
-    assign led = ~state[2:0]; 
+    // ★LEDをActive HIGH(正論理)に変更
+    assign led = state[2:0]; 
 
     reg [22:0] timer; 
     reg        is_series;   // 0: Parallel計測中, 1: Series計測中
@@ -138,6 +141,16 @@ module pveh_optimizer_core (
         .clk(clk), .rst_n(rst_n), .tx_start(uart_start),
         .tx_data(uart_data), .tx_busy(uart_busy), .uart_txd(uart_tx_pin)
     );
+
+    // ★デバッグ信号のアサイン (ロジアナで波形観測可能に)
+    assign debug_out[0] = is_series;
+    assign debug_out[1] = spi_start;
+    assign debug_out[2] = spi_busy;
+    assign debug_out[3] = spi_done;
+    assign debug_out[4] = uart_start;
+    assign debug_out[5] = uart_busy;
+    assign debug_out[6] = is_negative;
+    assign debug_out[7] = (state == ST_CALC_MULT); // 計算中フラグ
 
     function [7:0] hex2ascii(input [3:0] hex);
         begin
@@ -234,7 +247,7 @@ module pveh_optimizer_core (
                 ST_CALC_PREP: begin
                     mult_a <= (val_B > val_A) ? (val_B - val_A) : (val_A - val_B); // 絶対値
                     
-                    // ★修正：16ビット同士の足し算でオーバーフローしないよう、
+                    // 16ビット同士の足し算でオーバーフローしないよう、
                     // 事前に34ビットに拡張してから足し算を行う
                     mult_b <= {18'd0, val_B} + {18'd0, val_A}; 
                     
@@ -457,3 +470,4 @@ module uart_tx_32k (
         end
     end
 endmodule
+

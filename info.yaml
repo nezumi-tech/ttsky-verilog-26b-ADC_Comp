@@ -1,11 +1,11 @@
 # Tiny Tapeout project information
 project:
-  title:        ""      # Project title
-  author:       ""      # Your name
-  discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
+  title:        "TT ADC SQ Compare"      # Project title
+  author:       "Takaharu YAMADA"      # Your name
+  discord:      "nezumi_tech"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
+  description:  "For my academic research"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     153600       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
@@ -23,24 +23,24 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  ui[0]: "ext_trigger"
+  ui[1]: "spi_sdo"
+  ui[2]: "cfg_stable[2]"
+  ui[3]: "cfg_stable[1]"
+  ui[4]: "cfg_stable[0]"
+  ui[5]: "cfg_charge[2]"
+  ui[6]: "cfg_charge[1]"
+  ui[7]: "cfg_charge[0]"
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "spi_cs_n"
+  uo[1]: "spi_sck"
+  uo[2]: "uart_tx_pin"
+  uo[3]: "pulse_parallel"
+  uo[4]: "pulse_series"
+  uo[5]: "led[2]"
+  uo[6]: "led[1]"
+  uo[7]: "led[0]"
 
   # Bidirectional pins
   uio[0]: ""

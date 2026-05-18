@@ -233,7 +233,11 @@ module pveh_optimizer_core (
                 // (B - A) * (B + A) を計算
                 ST_CALC_PREP: begin
                     mult_a <= (val_B > val_A) ? (val_B - val_A) : (val_A - val_B); // 絶対値
-                    mult_b <= {17'd0, (val_B + val_A)};
+                    
+                    // ★修正：16ビット同士の足し算でオーバーフローしないよう、
+                    // 事前に34ビットに拡張してから足し算を行う
+                    mult_b <= {18'd0, val_B} + {18'd0, val_A}; 
+                    
                     mult_acc <= 34'd0;
                     mult_cnt <= 5'd17;
                     is_negative <= (val_A > val_B); // 符号フラグ
@@ -277,6 +281,8 @@ module pveh_optimizer_core (
                             uart_data <= hex2ascii(hex_sr[31:28]);
                             hex_sr <= hex_sr << 4;
                         end
+                    end else if (uart_start) begin
+                        uart_start <= 1'b0;
                         state <= ST_TX_WAIT;
                     end
                 end

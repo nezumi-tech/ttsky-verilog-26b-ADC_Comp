@@ -62,7 +62,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール 1] 環境発電最適化 コアロジック (面積超・最適化版)
+// [サブモジュール 1] 環境発電最適化 コアロジック (面積極限・最適化版)
 // =======================================================================
 module pveh_optimizer_core (
     input  wire clk,
@@ -86,34 +86,26 @@ module pveh_optimizer_core (
     wire [22:0] wait_stable_max = COUNT_1S << cfg_stable;
     wire [22:0] wait_charge_max = COUNT_1S << cfg_charge;
 
-    // ステート定義
-    reg [4:0] state;
-    localparam ST_IDLE          = 5'd0;
-    localparam ST_PLS_PAR_INIT  = 5'd1;
-    localparam ST_WAIT_STAB_P   = 5'd2;
-    localparam ST_READ_A        = 5'd3;
-    localparam ST_WAIT_CHG_P    = 5'd4;
-    localparam ST_READ_B        = 5'd5;
-    localparam ST_WAIT_REC      = 5'd6;
-    localparam ST_PLS_SER_INIT  = 5'd7;
-    localparam ST_WAIT_STAB_S   = 5'd8;
-    localparam ST_READ_C        = 5'd9;
-    localparam ST_WAIT_CHG_S    = 5'd10;
-    localparam ST_READ_D        = 5'd11;
-    
-    // 省面積・乗算器用ステート
-    localparam ST_CALC_PREP_P   = 5'd12;
-    localparam ST_CALC_MULT_P   = 5'd13;
-    localparam ST_CALC_PREP_S   = 5'd14;
-    localparam ST_CALC_MULT_S   = 5'd15;
-    
-    localparam ST_CALC_CMP      = 5'd16;
-    localparam ST_PLS_WINNER    = 5'd17;
-    localparam ST_TX_SEND       = 5'd18;
-    localparam ST_TX_WAIT       = 5'd19;
+    // --- サブルーチン化による統合ステート定義 ---
+    reg [3:0] state; // 12ステートなので4bitに削減
+    localparam ST_IDLE         = 4'd0;
+    localparam ST_PULSE_INIT   = 4'd1;
+    localparam ST_WAIT_STAB    = 4'd2;
+    localparam ST_READ_A       = 4'd3;
+    localparam ST_WAIT_CHG     = 4'd4;
+    localparam ST_READ_B       = 4'd5;
+    localparam ST_CALC_PREP    = 4'd6;
+    localparam ST_CALC_MULT    = 4'd7;
+    localparam ST_TX_CHUNK     = 4'd8;
+    localparam ST_TX_WAIT      = 4'd9;
+    localparam ST_WAIT_REC     = 4'd10;
+    localparam ST_PLS_WINNER   = 4'd11;
 
     assign led = ~state[2:0]; 
+
     reg [22:0] timer; 
+    reg        is_series;   // 0: Parallel計測中, 1: Series計測中
+    reg        is_negative; // 減算結果の符号フラグ
     
     reg        spi_start;
     wire       spi_busy, spi_done;
@@ -125,24 +117,22 @@ module pveh_optimizer_core (
         .spi_cs_n(spi_cs_n), .spi_sck(spi_sck), .spi_sdo(spi_sdo)
     );
 
-    // データレジスタ
-    reg [15:0] val_A, val_B, val_C, val_D;
+    // --- ADCレジスタ (C, Dを廃止し、A, Bを使い回す) ---
+    reg [15:0] val_A, val_B;
     
-    // 【面積削減】順次乗算(Shift & Add)用の共通レジスタ
-    // 計算式: (B-A) * (B+A) を計算する
-    reg [33:0] diff_P, diff_S;
+    // --- 順次乗算(Shift & Add)用レジスタ ---
+    reg signed [33:0] diff_P, diff_S;
     reg [16:0] mult_a;
     reg [33:0] mult_b;
     reg [33:0] mult_acc;
     reg [4:0]  mult_cnt;
     
-    reg [7:0]  cmp_char;
-
-    // UART制御用
+    // --- UART制御用 (シフトレジスタ化) ---
     reg         uart_start;
     reg [7:0]   uart_data;
     wire        uart_busy;
-    reg [5:0]   tx_idx; // 最大22なので6ビットに縮小
+    reg [4:0]   tx_step;     // 0〜22のステップカウンタ
+    reg [31:0]  hex_sr;      // データ押し出し用シフトレジスタ
 
     uart_tx_32k u_uart (
         .clk(clk), .rst_n(rst_n), .tx_start(uart_start),
@@ -156,6 +146,7 @@ module pveh_optimizer_core (
         end
     endfunction
 
+    // 外部トリガエッジ検出
     reg trig_d1, trig_d2;
     wire trig_pulse = (trig_d1 && !trig_d2);
 
@@ -164,112 +155,100 @@ module pveh_optimizer_core (
         else        {trig_d1, trig_d2} <= {ext_trigger, trig_d1};
     end
 
+    // --- オンザフライ計算 (組み合わせ回路) ---
+    // レジスタを消費せず、UART送信の瞬間に動的に計算します
+    wire [31:0] w_abs_diff = is_series ? 
+                             (diff_S[33] ? -diff_S[31:0] : diff_S[31:0]) :
+                             (diff_P[33] ? -diff_P[31:0] : diff_P[31:0]);
+
+    wire [7:0]  w_sign     = is_series ? 
+                             (diff_S[33] ? 8'h2D /*-*/ : 8'h2B /*+*/) :
+                             (diff_P[33] ? 8'h2D /*-*/ : 8'h2B /*+*/);
+
+    wire [7:0]  w_cmp_char = (diff_P > diff_S) ? 8'h3E /*>*/ : 
+                            ((diff_P < diff_S) ? 8'h3C /*<*/ : 8'h3D /*=*/);
+
+    // --- メインステートマシン ---
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= ST_IDLE;
             timer <= 23'd0;
+            is_series <= 1'b0;
+            is_negative <= 1'b0;
             pulse_parallel <= 1'b0;
-            pulse_series   <= 1'b0;
+            pulse_series <= 1'b0;
             spi_start <= 1'b0;
             uart_start <= 1'b0;
-            tx_idx <= 6'd0;
-            {val_A, val_B, val_C, val_D} <= 64'd0;
+            tx_step <= 5'd0;
+            hex_sr <= 32'd0;
+            {val_A, val_B} <= 32'd0;
             diff_P <= 34'd0; diff_S <= 34'd0;
             mult_a <= 17'd0; mult_b <= 34'd0; mult_acc <= 34'd0; mult_cnt <= 5'd0;
-            cmp_char <= 8'd0;
         end else begin
             case (state)
                 ST_IDLE: begin
-                    pulse_parallel <= 1'b0; pulse_series <= 1'b0;
-                    if (trig_pulse) begin timer <= 23'd0; state <= ST_PLS_PAR_INIT; end
-                end
-
-                ST_PLS_PAR_INIT: begin
-                    pulse_parallel <= 1'b1;
-                    if (timer >= COUNT_5MS - 1) begin pulse_parallel <= 1'b0; timer <= 23'd0; state <= ST_WAIT_STAB_P; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_WAIT_STAB_P: begin
-                    if (timer >= wait_stable_max - 1) begin spi_start <= 1'b1; state <= ST_READ_A; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_READ_A: begin
-                    spi_start <= 1'b0;
-                    if (spi_done) begin val_A <= spi_data; timer <= 23'd0; state <= ST_WAIT_CHG_P; end
-                end
-                ST_WAIT_CHG_P: begin
-                    if (timer >= wait_charge_max - 1) begin spi_start <= 1'b1; state <= ST_READ_B; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_READ_B: begin
-                    spi_start <= 1'b0;
-                    if (spi_done) begin val_B <= spi_data; timer <= 23'd0; state <= ST_WAIT_REC; end
-                end
-
-                ST_WAIT_REC: begin
-                    if (timer >= (COUNT_1S * 2) - 1) begin timer <= 23'd0; state <= ST_PLS_SER_INIT; end
-                    else timer <= timer + 1'b1;
-                end
-
-                ST_PLS_SER_INIT: begin
-                    pulse_series <= 1'b1;
-                    if (timer >= COUNT_5MS - 1) begin pulse_series <= 1'b0; timer <= 23'd0; state <= ST_WAIT_STAB_S; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_WAIT_STAB_S: begin
-                    if (timer >= wait_stable_max - 1) begin spi_start <= 1'b1; state <= ST_READ_C; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_READ_C: begin
-                    spi_start <= 1'b0;
-                    if (spi_done) begin val_C <= spi_data; timer <= 23'd0; state <= ST_WAIT_CHG_S; end
-                end
-                ST_WAIT_CHG_S: begin
-                    if (timer >= wait_charge_max - 1) begin spi_start <= 1'b1; state <= ST_READ_D; end
-                    else timer <= timer + 1'b1;
-                end
-                ST_READ_D: begin
-                    spi_start <= 1'b0;
-                    if (spi_done) begin val_D <= spi_data; state <= ST_CALC_PREP_P; end
-                end
-
-                // ----------------------------------------
-                // 【面積削減】順次乗算回路 (Shift & Add)
-                // ----------------------------------------
-                // (B - A) * (B + A) の準備
-                ST_CALC_PREP_P: begin
-                    mult_a <= (val_B > val_A) ? (val_B - val_A) : 17'd0;
-                    mult_b <= {17'd0, (val_B + val_A)};
-                    mult_acc <= 34'd0;
-                    mult_cnt <= 5'd17; // 17回のシフト加算で乗算を完了
-                    state <= ST_CALC_MULT_P;
-                end
-
-                ST_CALC_MULT_P: begin
-                    if (mult_cnt == 5'd0) begin
-                        diff_P <= mult_acc; // 乗算完了
-                        state <= ST_CALC_PREP_S;
-                    end else begin
-                        if (mult_a[0]) mult_acc <= mult_acc + mult_b; // 最下位ビットが1なら足す
-                        mult_a <= mult_a >> 1; // 右にシフト
-                        mult_b <= mult_b << 1; // 左にシフト
-                        mult_cnt <= mult_cnt - 1'b1;
+                    pulse_parallel <= 1'b0;
+                    pulse_series   <= 1'b0;
+                    if (trig_pulse) begin
+                        is_series <= 1'b0; // Parallelから開始
+                        timer <= 23'd0;
+                        state <= ST_PULSE_INIT;
                     end
                 end
 
-                // (D - C) * (D + C) の準備
-                ST_CALC_PREP_S: begin
-                    mult_a <= (val_D > val_C) ? (val_D - val_C) : 17'd0;
-                    mult_b <= {17'd0, (val_D + val_C)};
-                    mult_acc <= 34'd0;
-                    mult_cnt <= 5'd17;
-                    state <= ST_CALC_MULT_S;
+                ST_PULSE_INIT: begin
+                    pulse_parallel <= !is_series;
+                    pulse_series   <=  is_series;
+                    if (timer >= COUNT_5MS - 1) begin
+                        pulse_parallel <= 1'b0;
+                        pulse_series   <= 1'b0;
+                        timer <= 23'd0;
+                        state <= ST_WAIT_STAB;
+                    end else timer <= timer + 1'b1;
                 end
 
-                ST_CALC_MULT_S: begin
+                ST_WAIT_STAB: begin
+                    if (timer >= wait_stable_max - 1) begin
+                        spi_start <= 1'b1; state <= ST_READ_A;
+                    end else timer <= timer + 1'b1;
+                end
+
+                ST_READ_A: begin
+                    spi_start <= 1'b0;
+                    if (spi_done) begin val_A <= spi_data; timer <= 23'd0; state <= ST_WAIT_CHG; end
+                end
+
+                ST_WAIT_CHG: begin
+                    if (timer >= wait_charge_max - 1) begin
+                        spi_start <= 1'b1; state <= ST_READ_B;
+                    end else timer <= timer + 1'b1;
+                end
+
+                ST_READ_B: begin
+                    spi_start <= 1'b0;
+                    if (spi_done) begin val_B <= spi_data; state <= ST_CALC_PREP; end
+                end
+
+                // --- 面積極限削減: Shift & Add 乗算 ---
+                // (B - A) * (B + A) を計算
+                ST_CALC_PREP: begin
+                    mult_a <= (val_B > val_A) ? (val_B - val_A) : (val_A - val_B); // 絶対値
+                    mult_b <= {17'd0, (val_B + val_A)};
+                    mult_acc <= 34'd0;
+                    mult_cnt <= 5'd17;
+                    is_negative <= (val_A > val_B); // 符号フラグ
+                    state <= ST_CALC_MULT;
+                end
+
+                ST_CALC_MULT: begin
                     if (mult_cnt == 5'd0) begin
-                        diff_S <= mult_acc; // 乗算完了
-                        state <= ST_CALC_CMP;
+                        // 計算完了、符号を適用して保存
+                        if (!is_series) diff_P <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
+                        else            diff_S <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
+                        
+                        tx_step <= 5'd0;
+                        hex_sr  <= {val_A, val_B}; // 送信用のシフトレジスタにA,Bをロード
+                        state   <= ST_TX_CHUNK;
                     end else begin
                         if (mult_a[0]) mult_acc <= mult_acc + mult_b;
                         mult_a <= mult_a >> 1;
@@ -278,69 +257,64 @@ module pveh_optimizer_core (
                     end
                 end
 
-                // ----------------------------------------
-                // 勝敗判定
-                // ----------------------------------------
-                ST_CALC_CMP: begin
-                    if (diff_P > diff_S)       cmp_char <= 8'h3E; // '>'
-                    else if (diff_P < diff_S)  cmp_char <= 8'h3C; // '<'
-                    else                       cmp_char <= 8'h3D; // '='
-
-                    if (diff_P >= diff_S) pulse_parallel <= 1'b1;
-                    else                  pulse_series   <= 1'b1;
-
-                    timer <= 23'd0;
-                    state <= ST_PLS_WINNER;
-                end
-
-                ST_PLS_WINNER: begin
-                    if (timer >= COUNT_5MS - 1) begin
-                        pulse_parallel <= 1'b0;
-                        pulse_series   <= 1'b0;
-                        tx_idx <= 6'd0;
-                        state <= ST_TX_SEND;
-                    end else timer <= timer + 1'b1;
-                end
-
-                // ----------------------------------------
-                // 【面積削減】不要な送信データを削ぎ落としたUART
-                // ----------------------------------------
-                ST_TX_SEND: begin
+                // --- 配線混雑解消: シフトレジスタ方式のUART ---
+                ST_TX_CHUNK: begin
                     if (!uart_busy && !uart_start) begin
                         uart_start <= 1'b1;
-                        case (tx_idx)
-                            0: uart_data <= hex2ascii(val_A[15:12]); 1: uart_data <= hex2ascii(val_A[11:8]);
-                            2: uart_data <= hex2ascii(val_A[7:4]);   3: uart_data <= hex2ascii(val_A[3:0]);
-                            4: uart_data <= 8'h2C;
-                            5: uart_data <= hex2ascii(val_B[15:12]); 6: uart_data <= hex2ascii(val_B[11:8]);
-                            7: uart_data <= hex2ascii(val_B[7:4]);   8: uart_data <= hex2ascii(val_B[3:0]);
-                            9: uart_data <= 8'h2C;
-                            10: uart_data <= hex2ascii(val_C[15:12]); 11: uart_data <= hex2ascii(val_C[11:8]);
-                            12: uart_data <= hex2ascii(val_C[7:4]);   13: uart_data <= hex2ascii(val_C[3:0]);
-                            14: uart_data <= 8'h2C;
-                            15: uart_data <= hex2ascii(val_D[15:12]); 16: uart_data <= hex2ascii(val_D[11:8]);
-                            17: uart_data <= hex2ascii(val_D[7:4]);   18: uart_data <= hex2ascii(val_D[3:0]);
-                            19: uart_data <= 8'h2C;
-                            20: uart_data <= cmp_char;  
-                            21: uart_data <= 8'h0D;
-                            22: uart_data <= 8'h0A;
-                            default: uart_data <= 8'h00;
-                        endcase
-                    end else if (uart_start) begin
-                        uart_start <= 1'b0;
-                        state      <= ST_TX_WAIT;
+                        // 送信と同時にレジスタをシフトし、巨大なMUXを消去
+                        if (tx_step == 4 || tx_step == 9 || tx_step == 19) begin
+                            uart_data <= 8'h2C; // ',' カンマ
+                            if (tx_step == 9) hex_sr <= w_abs_diff; // 差分の絶対値をロード
+                        end else if (tx_step == 10) begin
+                            uart_data <= w_sign;
+                        end else if (tx_step == 20) begin
+                            uart_data <= w_cmp_char;
+                        end else if (tx_step == 21) begin
+                            uart_data <= 8'h0D; // '\r'
+                        end else if (tx_step == 22) begin
+                            uart_data <= 8'h0A; // '\n'
+                        end else begin
+                            uart_data <= hex2ascii(hex_sr[31:28]);
+                            hex_sr <= hex_sr << 4;
+                        end
+                        state <= ST_TX_WAIT;
                     end
                 end
 
                 ST_TX_WAIT: begin
                     if (!uart_start && !uart_busy) begin
-                        if (tx_idx == 6'd22) begin // 最大インデックスを22に変更
-                            state <= ST_IDLE; 
+                        if (!is_series && tx_step == 19) begin
+                            // Parallel側の送信完了 (カンマで終わる)。次はSeriesへ。
+                            is_series <= 1'b1;
+                            timer <= 23'd0;
+                            state <= ST_WAIT_REC;
+                        end else if (is_series && tx_step == 22) begin
+                            // Series側の送信完了 (改行で終わる)。勝者決定へ。
+                            timer <= 23'd0;
+                            state <= ST_PLS_WINNER;
                         end else begin
-                            tx_idx <= tx_idx + 1'b1;
-                            state  <= ST_TX_SEND;
+                            tx_step <= tx_step + 1'b1;
+                            state <= ST_TX_CHUNK;
                         end
                     end
+                end
+
+                ST_WAIT_REC: begin
+                    // 次の回路(Series)へ移る前に2秒待機して放電/安定化
+                    if (timer >= (COUNT_1S * 2) - 1) begin
+                        timer <= 23'd0; state <= ST_PULSE_INIT;
+                    end else timer <= timer + 1'b1;
+                end
+
+                ST_PLS_WINNER: begin
+                    // 勝者回路へ5msの切り替えパルスを出力して終了
+                    pulse_parallel <= (diff_P >= diff_S);
+                    pulse_series   <= (diff_P <  diff_S);
+                    if (timer >= COUNT_5MS - 1) begin
+                        pulse_parallel <= 1'b0;
+                        pulse_series   <= 1'b0;
+                        state <= ST_IDLE;
+                    end else timer <= timer + 1'b1;
                 end
 
                 default: state <= ST_IDLE;
@@ -351,7 +325,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール 2] LTC2450 SPI 読み出し (32.768kHz 駆動版)
+// [サブモジュール 2] LTC2450 SPI 読み出し
 // =======================================================================
 module ltc2450_spi_read_sync_32k (
     input  wire        clk,
@@ -430,7 +404,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール 3] UART 送信 (32.768kHz, 1200bps版)
+// [サブモジュール 3] UART 送信 (1200bps)
 // =======================================================================
 module uart_tx_32k (
     input  wire       clk,

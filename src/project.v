@@ -2,7 +2,6 @@
  * Copyright (c) 2024 Takaharu Yamada
  * SPDX-License-Identifier: Apache-2.0
  */
-
 `default_nettype none
 
 // =======================================================================
@@ -38,9 +37,7 @@ module tt_um_nezumi_tech_adc_sq_compare (
     assign uo_out[4]   = pulse_series;
     assign uo_out[7:5] = led;
 
-    // ★双方向ピン(uio)をすべて「出力モード(1)」に設定し、デバッグ信号を割り当て
     assign uio_oe  = 8'b1111_1111;
-
     wire _unused = &{ena, uio_in, 1'b0};
 
     pveh_optimizer_core u_core (
@@ -56,7 +53,7 @@ module tt_um_nezumi_tech_adc_sq_compare (
         .spi_sck(spi_sck),
         .uart_tx_pin(uart_tx_pin),
         .led(led),
-        .debug_out(uio_out) // ★デバッグ信号を uio_out に接続
+        .debug_out(uio_out)
     );
 
 endmodule
@@ -78,7 +75,7 @@ module pveh_optimizer_core (
     output wire spi_sck,
     output wire uart_tx_pin,
     output wire [2:0] led,
-    output wire [7:0] debug_out // ★デバッグ出力ポートを追加
+    output wire [7:0] debug_out
 );
 
     parameter CLK_FREQ = 32_768; 
@@ -89,7 +86,7 @@ module pveh_optimizer_core (
     wire [22:0] wait_charge_max = COUNT_1S << cfg_charge;
 
     // --- サブルーチン化による統合ステート定義 ---
-    reg [3:0] state; // 12ステートなので4bitに削減
+    reg [3:0] state; 
     localparam ST_IDLE         = 4'd0;
     localparam ST_PULSE_INIT   = 4'd1;
     localparam ST_WAIT_STAB    = 4'd2;
@@ -102,13 +99,16 @@ module pveh_optimizer_core (
     localparam ST_TX_WAIT      = 4'd9;
     localparam ST_WAIT_REC     = 4'd10;
     localparam ST_PLS_WINNER   = 4'd11;
+    
+    // ★ ビットシリアル比較用の新規ステート
+    localparam ST_CMP_START    = 4'd12;
+    localparam ST_CMP_SHIFT    = 4'd13;
 
-    // ★LEDをActive HIGH(正論理)に変更
     assign led = state[2:0]; 
 
     reg [22:0] timer; 
-    reg        is_series;   // 0: Parallel計測中, 1: Series計測中
-    reg        is_negative; // 減算結果の符号フラグ
+    reg        is_series;
+    reg        is_negative; 
     
     reg        spi_start;
     wire       spi_busy, spi_done;
@@ -120,29 +120,31 @@ module pveh_optimizer_core (
         .spi_cs_n(spi_cs_n), .spi_sck(spi_sck), .spi_sdo(spi_sdo)
     );
 
-    // --- ADCレジスタ (C, Dを廃止し、A, Bを使い回す) ---
     reg [15:0] val_A, val_B;
-    
-    // --- 順次乗算(Shift & Add)用レジスタ ---
     reg signed [33:0] diff_P, diff_S;
+    
     reg [16:0] mult_a;
     reg [33:0] mult_b;
     reg [33:0] mult_acc;
-    reg [4:0]  mult_cnt;
     
-    // --- UART制御用 (シフトレジスタ化) ---
+    // ★ 比較の34回カウントも兼用するため 5bit -> 6bit に拡張
+    reg [5:0]  mult_cnt; 
+    
+    // ★ ビットシリアル比較用のレジスタ
+    reg        cmp_locked;
+    reg [7:0]  cmp_char_reg; 
+    
     reg         uart_start;
     reg [7:0]   uart_data;
     wire        uart_busy;
-    reg [4:0]   tx_step;     // 0〜22のステップカウンタ
-    reg [31:0]  hex_sr;      // データ押し出し用シフトレジスタ
+    reg [4:0]   tx_step;
+    reg [31:0]  hex_sr;
 
     uart_tx_32k u_uart (
         .clk(clk), .rst_n(rst_n), .tx_start(uart_start),
         .tx_data(uart_data), .tx_busy(uart_busy), .uart_txd(uart_tx_pin)
     );
 
-    // ★デバッグ信号のアサイン (ロジアナで波形観測可能に)
     assign debug_out[0] = is_series;
     assign debug_out[1] = spi_start;
     assign debug_out[2] = spi_busy;
@@ -150,7 +152,7 @@ module pveh_optimizer_core (
     assign debug_out[4] = uart_start;
     assign debug_out[5] = uart_busy;
     assign debug_out[6] = is_negative;
-    assign debug_out[7] = (state == ST_CALC_MULT); // 計算中フラグ
+    assign debug_out[7] = (state == ST_CALC_MULT) || (state == ST_CMP_SHIFT); 
 
     function [7:0] hex2ascii(input [3:0] hex);
         begin
@@ -159,7 +161,6 @@ module pveh_optimizer_core (
         end
     endfunction
 
-    // 外部トリガエッジ検出
     reg trig_d1, trig_d2;
     wire trig_pulse = (trig_d1 && !trig_d2);
 
@@ -168,8 +169,7 @@ module pveh_optimizer_core (
         else        {trig_d1, trig_d2} <= {ext_trigger, trig_d1};
     end
 
-    // --- オンザフライ計算 (組み合わせ回路) ---
-    // レジスタを消費せず、UART送信の瞬間に動的に計算します
+    // 組み合わせ回路コンパレータ(w_cmp_char)は削除
     wire [31:0] w_abs_diff = is_series ? 
                              (diff_S[33] ? -diff_S[31:0] : diff_S[31:0]) :
                              (diff_P[33] ? -diff_P[31:0] : diff_P[31:0]);
@@ -178,10 +178,6 @@ module pveh_optimizer_core (
                              (diff_S[33] ? 8'h2D /*-*/ : 8'h2B /*+*/) :
                              (diff_P[33] ? 8'h2D /*-*/ : 8'h2B /*+*/);
 
-    wire [7:0]  w_cmp_char = (diff_P > diff_S) ? 8'h3E /*>*/ : 
-                            ((diff_P < diff_S) ? 8'h3C /*<*/ : 8'h3D /*=*/);
-
-    // --- メインステートマシン ---
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= ST_IDLE;
@@ -196,14 +192,17 @@ module pveh_optimizer_core (
             hex_sr <= 32'd0;
             {val_A, val_B} <= 32'd0;
             diff_P <= 34'd0; diff_S <= 34'd0;
-            mult_a <= 17'd0; mult_b <= 34'd0; mult_acc <= 34'd0; mult_cnt <= 5'd0;
+            mult_a <= 17'd0; mult_b <= 34'd0; mult_acc <= 34'd0; 
+            mult_cnt <= 6'd0;
+            cmp_locked <= 1'b0;
+            cmp_char_reg <= 8'h3D;
         end else begin
             case (state)
                 ST_IDLE: begin
                     pulse_parallel <= 1'b0;
                     pulse_series   <= 1'b0;
                     if (trig_pulse) begin
-                        is_series <= 1'b0; // Parallelから開始
+                        is_series <= 1'b0;
                         timer <= 23'd0;
                         state <= ST_PULSE_INIT;
                     end
@@ -242,30 +241,27 @@ module pveh_optimizer_core (
                     if (spi_done) begin val_B <= spi_data; state <= ST_CALC_PREP; end
                 end
 
-                // --- 面積極限削減: Shift & Add 乗算 ---
-                // (B - A) * (B + A) を計算
                 ST_CALC_PREP: begin
-                    mult_a <= (val_B > val_A) ? (val_B - val_A) : (val_A - val_B); // 絶対値
-                    
-                    // 16ビット同士の足し算でオーバーフローしないよう、
-                    // 事前に34ビットに拡張してから足し算を行う
+                    mult_a <= (val_B > val_A) ? (val_B - val_A) : (val_A - val_B); 
                     mult_b <= {18'd0, val_B} + {18'd0, val_A}; 
-                    
                     mult_acc <= 34'd0;
-                    mult_cnt <= 5'd17;
-                    is_negative <= (val_A > val_B); // 符号フラグ
+                    mult_cnt <= 6'd17;
+                    is_negative <= (val_A > val_B); 
                     state <= ST_CALC_MULT;
                 end
 
                 ST_CALC_MULT: begin
-                    if (mult_cnt == 5'd0) begin
-                        // 計算完了、符号を適用して保存
-                        if (!is_series) diff_P <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
-                        else            diff_S <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
-                        
-                        tx_step <= 5'd0;
-                        hex_sr  <= {val_A, val_B}; // 送信用のシフトレジスタにA,Bをロード
-                        state   <= ST_TX_CHUNK;
+                    if (mult_cnt == 6'd0) begin
+                        if (!is_series) begin
+                            diff_P <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
+                            tx_step <= 5'd0;
+                            hex_sr  <= {val_A, val_B};
+                            state   <= ST_TX_CHUNK;
+                        end else begin
+                            diff_S <= is_negative ? -$signed({1'b0, mult_acc[32:0]}) : $signed({1'b0, mult_acc[32:0]});
+                            // ★ Seriesの計算が終わったらUARTの前にビットシリアル比較へ飛ぶ
+                            state   <= ST_CMP_START;
+                        end
                     end else begin
                         if (mult_a[0]) mult_acc <= mult_acc + mult_b;
                         mult_a <= mult_a >> 1;
@@ -274,22 +270,62 @@ module pveh_optimizer_core (
                     end
                 end
 
-                // --- 配線混雑解消: シフトレジスタ方式のUART ---
+                // ----------------------------------------
+                // ★ 新規: ビットシリアル比較 (34クロック)
+                // ----------------------------------------
+                ST_CMP_START: begin
+                    mult_cnt <= 6'd34;
+                    cmp_locked <= 1'b0;
+                    cmp_char_reg <= 8'h3D; // '=' で初期化
+                    state <= ST_CMP_SHIFT;
+                end
+
+                ST_CMP_SHIFT: begin
+                    // Circular Shift (MSB first) を実行し、データを壊さずに回す
+                    diff_P <= {diff_P[32:0], diff_P[33]};
+                    diff_S <= {diff_S[32:0], diff_S[33]};
+
+                    if (!cmp_locked) begin
+                        if (diff_P[33] != diff_S[33]) begin // 差が見つかった瞬間
+                            if (mult_cnt == 6'd34) begin
+                                // 符号ビットの比較 (1=負, 0=正)
+                                // Pが1(負)なら P < S
+                                cmp_char_reg <= diff_P[33] ? 8'h3C : 8'h3E;
+                            end else begin
+                                // 絶対値ビットの比較
+                                // Pが1なら P > S
+                                cmp_char_reg <= diff_P[33] ? 8'h3E : 8'h3C;
+                            end
+                            cmp_locked <= 1'b1; // 以降のシフトでは判定をロック
+                        end
+                    end
+
+                    if (mult_cnt == 6'd1) begin
+                        // 34回のシフトが完了 (レジスタが完全に元の位置に戻った)
+                        tx_step <= 5'd0;
+                        hex_sr  <= {val_A, val_B};
+                        state   <= ST_TX_CHUNK; // SeriesのUART送信へ
+                    end else begin
+                        mult_cnt <= mult_cnt - 1'b1;
+                    end
+                end
+
+                // ----------------------------------------
+                
                 ST_TX_CHUNK: begin
                     if (!uart_busy && !uart_start) begin
                         uart_start <= 1'b1;
-                        // 送信と同時にレジスタをシフトし、巨大なMUXを消去
                         if (tx_step == 4 || tx_step == 9 || tx_step == 19) begin
-                            uart_data <= 8'h2C; // ',' カンマ
-                            if (tx_step == 9) hex_sr <= w_abs_diff; // 差分の絶対値をロード
+                            uart_data <= 8'h2C;
+                            if (tx_step == 9) hex_sr <= w_abs_diff;
                         end else if (tx_step == 10) begin
                             uart_data <= w_sign;
                         end else if (tx_step == 20) begin
-                            uart_data <= w_cmp_char;
+                            uart_data <= cmp_char_reg; // ★計算済みのレジスタを使用
                         end else if (tx_step == 21) begin
-                            uart_data <= 8'h0D; // '\r'
+                            uart_data <= 8'h0D;
                         end else if (tx_step == 22) begin
-                            uart_data <= 8'h0A; // '\n'
+                            uart_data <= 8'h0A;
                         end else begin
                             uart_data <= hex2ascii(hex_sr[31:28]);
                             hex_sr <= hex_sr << 4;
@@ -303,12 +339,10 @@ module pveh_optimizer_core (
                 ST_TX_WAIT: begin
                     if (!uart_start && !uart_busy) begin
                         if (!is_series && tx_step == 19) begin
-                            // Parallel側の送信完了 (カンマで終わる)。次はSeriesへ。
                             is_series <= 1'b1;
                             timer <= 23'd0;
                             state <= ST_WAIT_REC;
                         end else if (is_series && tx_step == 22) begin
-                            // Series側の送信完了 (改行で終わる)。勝者決定へ。
                             timer <= 23'd0;
                             state <= ST_PLS_WINNER;
                         end else begin
@@ -319,16 +353,16 @@ module pveh_optimizer_core (
                 end
 
                 ST_WAIT_REC: begin
-                    // 次の回路(Series)へ移る前に2秒待機して放電/安定化
                     if (timer >= (COUNT_1S * 2) - 1) begin
                         timer <= 23'd0; state <= ST_PULSE_INIT;
                     end else timer <= timer + 1'b1;
                 end
 
                 ST_PLS_WINNER: begin
-                    // 勝者回路へ5msの切り替えパルスを出力して終了
-                    pulse_parallel <= (diff_P >= diff_S);
-                    pulse_series   <= (diff_P <  diff_S);
+                    // ★ コンパレータを廃止し、判定済みレジスタでパルスを決定
+                    pulse_parallel <= (cmp_char_reg == 8'h3E) || (cmp_char_reg == 8'h3D);
+                    pulse_series   <= (cmp_char_reg == 8'h3C);
+                    
                     if (timer >= COUNT_5MS - 1) begin
                         pulse_parallel <= 1'b0;
                         pulse_series   <= 1'b0;
@@ -344,7 +378,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール 2] LTC2450 SPI 読み出し
+// [サブモジュール 2] LTC2450 SPI 読み出し (変更なし)
 // =======================================================================
 module ltc2450_spi_read_sync_32k (
     input  wire        clk,
@@ -423,7 +457,7 @@ endmodule
 
 
 // =======================================================================
-// [サブモジュール 3] UART 送信 (1200bps)
+// [サブモジュール 3] UART 送信 (変更なし)
 // =======================================================================
 module uart_tx_32k (
     input  wire       clk,
@@ -470,4 +504,3 @@ module uart_tx_32k (
         end
     end
 endmodule
-
